@@ -60,6 +60,9 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
     num("ssm.inner_size", g.ssm_value_dim);
     num("full_attention_interval", g.qsa_interval);
     g.head_dim = key_length;
+    // qwen4exp's in-file NextN layers are outside the trunk.  Drafts come from --mtp, so they do not count as
+    // n_mtp_layers (compiled_geometry_mismatch pins that to 0).
+    int64_t nextn = 0;
     if (family == strata::ModelFamily::Qwen35Moe) {
         num("nextn_predict_layers", g.n_mtp_layers);
         g.hc = g.hc_lr = 0;                 // a plain pre-norm residual
@@ -69,8 +72,12 @@ inline bool geometry_from_gguf(const strata::GgufFile& meta, ModelGeometry& g, i
         num("hyper_connection.low_rank", g.hc_lr);
         num("attention.indexer.head_count", g.idx_q_heads);
         num("attention.indexer.key_length", g.idx_key_dim);
+        strata::NextnTail tail;
+        err = strata::qwen4exp_nextn_tail(meta, tail);
+        if (!err.empty()) return false;
+        nextn = tail.count();
     }
-    g.n_layers = block_count - g.n_mtp_layers;
+    g.n_layers = block_count - g.n_mtp_layers - nextn;
     g.ssm_conv_channels = 2 * g.ssm_state_size * g.ssm_k_heads + g.ssm_value_dim;
     if (const strata::MetaValue* v = meta.get("tokenizer.ggml.tokens"))
         if (v->type == strata::MetaType::ARRAY && v->count > 0) g.n_vocab = (int64_t) v->count;

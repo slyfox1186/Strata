@@ -35,8 +35,9 @@ def require_gguf_py(test):
     return setUpClass
 
 
-def write_gguf(path, tensors, split=None, arch=True):
-    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no)."""
+def write_gguf(path, tensors, split=None, arch=True, kv=()):
+    """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no).  `kv`: more metadata, as
+    (GGUFWriter method, key, value), e.g. ("add_uint32", "qwen4exp.block_count", 3)."""
     writer = GGUFWriter(path, "qwen4exp")
     if not arch:                                   # a later shard of a split: no model metadata
         writer.kv_data[0].pop("general.architecture", None)
@@ -44,6 +45,8 @@ def write_gguf(path, tensors, split=None, arch=True):
         writer.add_uint16("split.no", split[0])
         writer.add_uint16("split.count", split[1])
         writer.add_int32("split.tensors.count", split[2])
+    for method, key, value in kv:
+        getattr(writer, method)(key, value)
     for name, values, kind in tensors:
         writer.add_tensor(name, quants.quantize(values, kind), raw_dtype=kind)
     writer.write_header_to_file()
@@ -381,8 +384,21 @@ def expert(seed, shape):
     return np.random.default_rng(seed).standard_normal((N_EXPERT, *shape)).astype(np.float32)
 
 
-def split_model(root, name="model", split_layer=True, dup=False, split_no=None, gate1=None, seed=0):
-    """Writes the 4 shards; returns their paths."""
+def nextn_block(l, seed=0):
+    """The tensors of an in-file NextN block `l`: a router, the experts and an attention projection."""
+    gu = (32, 32)
+    return [(f"blk.{l}.ffn_gate_inp.weight", np.full((N_EXPERT, 32), 0.25, np.float32), Q.F32)] + \
+        [(f"blk.{l}.ffn_{r}_exps.weight", expert(seed + 30 + i, gu), Q.Q8_0) for i, r in enumerate(ROLES)] + \
+        [(f"blk.{l}.attn_q.weight", np.linspace(-1, 1, 1024, dtype=np.float32).reshape(32, 32), Q.Q8_0)]
+
+
+ROLES = ("gate", "up", "down")
+
+
+def split_model(root, name="model", split_layer=True, dup=False, split_no=None, gate1=None, seed=0, kv=(),
+                tail=()):
+    """Writes the 4 shards; returns their paths.  `kv` goes into shard 1's metadata; the blocks `tail` (in-file
+    NextN blocks) into shard 2."""
     gate1 = Q.Q8_0 if gate1 is None else gate1      # not a default arg: the module imports without gguf-py
     gu, dn = (32, 32), (32, 32)
     router = [(f"blk.{l}.ffn_gate_inp.weight", np.full((N_EXPERT, 32), 0.5, np.float32), Q.F32) for l in (0, 1)]
@@ -393,6 +409,8 @@ def split_model(root, name="model", split_layer=True, dup=False, split_no=None, 
     l1_d = [("blk.1.ffn_down_exps.weight", expert(seed + 22, dn), Q.F32)]
     shards = [[], router + l0 + (l1_d if split_layer else []), l1_gu + ([] if split_layer else l1_d),
               [("output_norm.weight", np.ones(32, np.float32), Q.F32)]]
+    for l in tail:
+        shards[1] += nextn_block(l, seed)
     if dup:
         shards[3].append(l1_gu[1])
     total = sum(len(s) for s in shards)
@@ -400,7 +418,7 @@ def split_model(root, name="model", split_layer=True, dup=False, split_no=None, 
     for i, tensors in enumerate(shards):
         p = root / f"{name}-{i + 1:05d}-of-00004.gguf"
         no = split_no.get(i, i) if split_no else i
-        write_gguf(p, tensors, split=(no, 4, total), arch=i == 0)
+        write_gguf(p, tensors, split=(no, 4, total), arch=i == 0, kv=kv if i == 0 else ())
         paths.append(p)
     return paths
 
@@ -656,6 +674,191 @@ class SplitArtifactTests(unittest.TestCase):
             (pack / "experts.bin").write_bytes(stale)
             rc, log = run_pack(paths[0], pack, "--experts-bin")
             self.assertEqual((pack / "experts.bin").read_bytes(), want)
+
+
+NEXTN = "qwen4exp.nextn_predict_layers"
+BLOCKS = "qwen4exp.block_count"
+
+
+def pack_files(out):
+    """Every file of a pack, by name: the bytes to compare."""
+    return {p.relative_to(out).as_posix(): p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file()}
+
+
+class NextnTests(unittest.TestCase):
+    """A qwen4exp file's in-file NextN (MTP) blocks: validated, then left out of the pack (the engine drafts with
+    --mtp).  The rules and messages are the engine's (gguf_reader.hpp qwen4exp_nextn_tail)."""
+    setUpClass = require_gguf_py(unittest.TestCase)
+
+    def test_rules(self):
+        meta = {"general.architecture": "qwen4exp", NEXTN: 1, BLOCKS: 49}
+        self.assertEqual(iq_pack.nextn_tail(meta), (48, 49))
+        self.assertEqual(iq_pack.nextn_tail({**meta, NEXTN: 2}), (47, 49))
+        self.assertIsNone(iq_pack.nextn_tail({"general.architecture": "qwen4exp", BLOCKS: 49}))
+        self.assertIsNone(iq_pack.nextn_tail({"general.architecture": "qwen4exp", NEXTN: 0}))
+        self.assertIsNone(iq_pack.nextn_tail({"general.architecture": "qwen4exp", NEXTN: 0, BLOCKS: "x"}))
+        self.assertIsNone(iq_pack.nextn_tail({"general.architecture": "qwen35moe",
+                                              "qwen35moe.nextn_predict_layers": 1, NEXTN: 1, BLOCKS: 49}))
+        refused = [
+            ({NEXTN: True}, f"{NEXTN} is not an integer"), ({NEXTN: False}, f"{NEXTN} is not an integer"),
+            ({NEXTN: 1.0}, f"{NEXTN} is not an integer"), ({NEXTN: 0.0}, f"{NEXTN} is not an integer"),
+            ({NEXTN: "1"}, f"{NEXTN} is not an integer"), ({NEXTN: [1]}, f"{NEXTN} is not an integer"),
+            ({NEXTN: -1}, f"{NEXTN} = -1, it must not be negative"),
+            ({NEXTN: 2**63}, f"{NEXTN} = {2**63} is out of range"),
+            ({NEXTN: 2**64 - 1}, f"{NEXTN} = {2**64 - 1} is out of range"),
+            ({NEXTN: 49}, f"{NEXTN} = 49 is not smaller than {BLOCKS} = 49"),
+            ({NEXTN: 50}, f"{NEXTN} = 50 is not smaller than {BLOCKS} = 49"),
+            ({BLOCKS: 2**63}, f"{BLOCKS} = {2**63} is out of range"),
+            ({BLOCKS: True}, f"{BLOCKS} is not an integer"),
+            ({BLOCKS: 0}, f"{BLOCKS} = 0, it must be positive"),
+        ]
+        for change, message in refused:
+            with self.subTest(change=change), self.assertRaises(ValueError) as caught:
+                iq_pack.nextn_tail({**meta, **change})
+            self.assertEqual(str(caught.exception), message)
+        with self.assertRaises(ValueError) as caught:
+            iq_pack.nextn_tail({"general.architecture": "qwen4exp", NEXTN: 1})
+        self.assertEqual(str(caught.exception), f"missing {BLOCKS}")
+
+    def test_tensor_names(self):
+        tail = (47, 49)
+        for name, want in [("blk.47.attn_q.weight", True), ("blk.48.nextn.eh_proj.weight", True),
+                           ("blk.46.attn_q.weight", False), ("blk.49.attn_q.weight", False),
+                           ("blk.48", False), ("blk.+48.attn_q.weight", False), ("blk.4x.attn_q.weight", False),
+                           ("output.weight", False)]:
+            self.assertEqual(iq_pack.in_tail(tail, name), want, name)
+        self.assertFalse(iq_pack.in_tail(None, "blk.48.attn_q.weight"))
+        self.assertTrue(iq_pack.in_tail(tail, "blk.0048.attn_q.weight"))
+        self.assertTrue(iq_pack.in_tail(tail, "blk." + "0" * 5000 + "48.attn_q.weight"))
+        self.assertTrue(iq_pack.in_tail((0, 1), "blk.000.attn_q.weight"))
+        whole = (0, iq_pack.INT64_MAX)
+        self.assertTrue(iq_pack.in_tail(whole, f"blk.{iq_pack.INT64_MAX - 1}.attn_q.weight"))
+        for name in [f"blk.{iq_pack.INT64_MAX}.attn_q.weight", f"blk.{iq_pack.INT64_MAX + 1}.attn_q.weight",
+                     "blk.9223372036854775808.attn_q.weight", "blk." + "9" * 5000 + ".attn_q.weight"]:
+            self.assertFalse(iq_pack.in_tail(whole, name), name[:40])
+
+    def test_the_tail_is_left_out(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            paths = split_model(root, split_layer=False, tail=(2,),
+                                kv=[("add_uint32", BLOCKS, 3), ("add_uint32", NEXTN, 1)])
+            rc, log = run_pack(paths[0], root / "pack")
+            self.assertEqual(rc, 0, log)
+            self.assertIn("in-file NextN layer 2: 5 tensors left out (the engine drafts with --mtp)", log)
+            head, *lines = (root / "pack" / "native_experts.txt").read_text().splitlines()
+            self.assertEqual([ln.split()[0] for ln in lines], ["0", "1"])
+            _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+            self.assertFalse([n for n in rows if n.startswith("blk.2.")])
+            self.assertIn("blk.1.ffn_gate_inp.weight", rows)
+            conv = json.loads((root / "pack" / "conversions.json").read_text())
+            self.assertEqual([s["name"] for s in conv["source_shards"]], [p.name for p in paths])
+            with contextlib.redirect_stdout(io.StringIO()):
+                model = iq_pack.Model(paths[0])
+            self.assertFalse([n for n in model.where if n.startswith("blk.2.")])
+
+    def test_absent_or_zero_count_packs_as_before(self):
+        cases = {"absent": [], "zero": [("add_uint32", NEXTN, 0)],
+                 "zero, block_count not an integer": [("add_uint32", NEXTN, 0), ("add_string", BLOCKS, "x")]}
+        for label, kv in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                root = Path(tmp)
+                paths = split_model(root, split_layer=False, kv=kv)
+                rc, log = run_pack(paths[0], root / "pack", "--experts-bin")
+                self.assertEqual(rc, 0, log)
+                self.assertNotIn("NextN", log)
+                with patch.object(iq_pack, "nextn_tail", return_value=None):
+                    rc, before = run_pack(paths[0], root / "before", "--experts-bin")
+                self.assertEqual(rc, 0, before)
+                self.assertEqual(log.replace(str(root / "pack"), "OUT"), before.replace(str(root / "before"), "OUT"))
+                self.assertEqual(pack_files(root / "pack"), pack_files(root / "before"))
+
+    def test_invalid_counts_are_refused_before_the_pack_changes(self):
+        cases = [
+            ([("add_bool", NEXTN, True)], f"{NEXTN} is not an integer"),
+            ([("add_bool", NEXTN, False)], f"{NEXTN} is not an integer"),
+            ([("add_float32", NEXTN, 1.0)], f"{NEXTN} is not an integer"),
+            ([("add_float64", NEXTN, 0.0)], f"{NEXTN} is not an integer"),
+            ([("add_string", NEXTN, "1")], f"{NEXTN} is not an integer"),
+            ([("add_array", NEXTN, [1])], f"{NEXTN} is not an integer"),
+            ([("add_int8", NEXTN, -1)], f"{NEXTN} = -1, it must not be negative"),
+            ([("add_int16", NEXTN, -1)], f"{NEXTN} = -1, it must not be negative"),
+            ([("add_int32", NEXTN, -1)], f"{NEXTN} = -1, it must not be negative"),
+            ([("add_int64", NEXTN, -1)], f"{NEXTN} = -1, it must not be negative"),
+            ([("add_uint64", NEXTN, 2**63)], f"{NEXTN} = {2**63} is out of range"),
+            ([("add_uint64", NEXTN, 2**64 - 1)], f"{NEXTN} = {2**64 - 1} is out of range"),
+            ([("add_uint32", NEXTN, 1)], f"missing {BLOCKS}"),
+            ([("add_uint32", NEXTN, 1), ("add_uint64", BLOCKS, 2**63)], f"{BLOCKS} = {2**63} is out of range"),
+            ([("add_uint32", NEXTN, 1), ("add_string", BLOCKS, "3")], f"{BLOCKS} is not an integer"),
+            ([("add_uint32", NEXTN, 3), ("add_uint32", BLOCKS, 3)], f"{NEXTN} = 3 is not smaller than {BLOCKS} = 3"),
+        ]
+        for kv, message in cases:
+            with self.subTest(kv=kv), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                root = Path(tmp)
+                paths = split_model(root, split_layer=False, tail=(2,), kv=kv)
+                pack = root / "pack"
+                pack.mkdir()
+                (pack / "native_experts.txt").write_text("previous pack")
+                with self.assertRaises(ValueError) as caught:
+                    run_pack(paths[0], pack)
+                self.assertEqual(str(caught.exception), message)
+                self.assertEqual((pack / "native_experts.txt").read_text(), "previous pack")
+                self.assertEqual(sorted(p.name for p in pack.iterdir()), ["native_experts.txt", "tokenizer"])
+
+    def base_pack(self, root, router=0.5):
+        """A one-file trunk-only model (layers 0 and 1) and its pack, with the manifest --base reads."""
+        model = root / "base.gguf"
+        write_gguf(model, self.trunk(router))
+        rc, log = run_pack(model, root / "base")
+        self.assertEqual(rc, 0, log)
+        (root / "base" / "manifest.json").write_text(json.dumps({"source": {"shard1": str(model)}}))
+        return root / "base"
+
+    @staticmethod
+    def trunk(router=0.5):
+        return [(f"blk.{l}.ffn_gate_inp.weight", np.full((N_EXPERT, 32), router, np.float32), Q.F32) for l in (0, 1)] + \
+            [(f"blk.{l}.ffn_{r}_exps.weight", expert(10 * l + i, (32, 32)), Q.Q8_0)
+             for l in (0, 1) for i, r in enumerate(ROLES)] + \
+            [("output_norm.weight", np.ones(32, np.float32), Q.F32)]
+
+    def nextn_model(self, root, router=0.5):
+        model = root / "nextn.gguf"
+        write_gguf(model, self.trunk(router) + nextn_block(2), kv=[("add_uint32", BLOCKS, 3), ("add_uint32", NEXTN, 1)])
+        return model
+
+    def test_base_pack(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            base = self.base_pack(root)
+            rc, log = run_pack(self.nextn_model(root), root / "pack", "--base", str(base))
+            self.assertEqual(rc, 0, log)
+            _, rows = iq_pack.read_index(root / "pack" / "index.txt")
+            self.assertEqual(sorted(rows), sorted(iq_pack.read_index(base / "index.txt")[1]))
+            head, *lines = (root / "pack" / "native_experts.txt").read_text().splitlines()
+            self.assertEqual([ln.split()[0] for ln in lines], ["0", "1"])
+
+    def test_base_pack_with_tail_rows_is_refused(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            base = self.base_pack(root)
+            index = base / "index.txt"
+            row = index.read_text().splitlines()[-1].split(maxsplit=1)
+            index.write_text(index.read_text() + "blk.2.attn_q.weight " + row[1] + "\n")
+            pack = root / "pack"
+            pack.mkdir()
+            (pack / "native_experts.txt").write_text("previous pack")
+            rc, log = run_pack(self.nextn_model(root), pack, "--base", str(base))
+            self.assertEqual(rc, 1)
+            self.assertIn("--base: the base pack has rows of this model's in-file NextN layers "
+                          "(blk.2.attn_q.weight)", log)
+            self.assertEqual((pack / "native_experts.txt").read_text(), "previous pack")
+
+    def test_base_pack_with_other_floats_is_still_refused(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            base = self.base_pack(root, router=0.5)
+            rc, log = run_pack(self.nextn_model(root, router=0.75), root / "pack", "--base", str(base))
+            self.assertEqual(rc, 1)
+            self.assertIn("float tensor blk.0.ffn_gate_inp.weight differs from the base model", log)
 
 
 class HadamardTests(unittest.TestCase):

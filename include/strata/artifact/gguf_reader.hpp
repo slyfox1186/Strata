@@ -32,6 +32,8 @@
 #include <set>
 #include <stdexcept>
 #include <algorithm>
+#include <charconv>
+#include <string_view>
 
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/geometry.hpp"
@@ -664,6 +666,75 @@ inline std::string check_architecture_qwen35moe(const GgufFile& g) {
     return {};
 }
 
+/// The layer of a "blk.<l>.<rest>" tensor name: true, with `l`, only for "blk." followed by decimal digits and a dot.
+inline bool blk_index(std::string_view name, int64_t& l) {
+    if (!name.starts_with("blk.")) return false;
+    const char* begin = name.data() + 4;
+    const char* end = name.data() + name.size();
+    if (begin == end || *begin < '0' || *begin > '9') return false;
+    const auto [stop, ec] = std::from_chars(begin, end, l);
+    return ec == std::errc() && stop != end && *stop == '.';
+}
+
+/// The blocks [first, end) of a qwen4exp file that are its in-file NextN (MTP) layers: the last
+/// `nextn_predict_layers` of its `block_count` blocks, which are not part of the trunk (llama.cpp's n_layer() is
+/// block_count - nextn_predict_layers).  The engine drafts from its own --mtp head and reads none of their
+/// tensors.  Inactive (first = end = -1) for another architecture and for a file without a positive count.
+struct NextnTail {
+    int64_t first = -1, end = -1;
+    bool active() const { return first >= 0; }
+    int64_t count() const { return active() ? end - first : 0; }
+    bool contains(int64_t l) const { return active() && l >= first && l < end; }
+    bool covers(std::string_view tensor_name) const {
+        int64_t l = 0;
+        return active() && blk_index(tensor_name, l) && contains(l);
+    }
+};
+
+/// `v` as an int64_t: "" when it is an integer type (not a bool) that fits, else why not.  The reader stores the
+/// signed widths sign-extended and the unsigned ones as they are, so an unsigned value past INT64_MAX is refused
+/// here rather than read as a negative number.
+inline std::string meta_int64(const MetaValue& v, const std::string& key, int64_t& out) {
+    switch (v.type) {
+    case MetaType::U8: case MetaType::U16: case MetaType::U32: case MetaType::U64:
+        if (v.u > (uint64_t) std::numeric_limits<int64_t>::max())
+            return key + " = " + std::to_string(v.u) + " is out of range";
+        out = (int64_t) v.u;
+        return {};
+    case MetaType::I8: case MetaType::I16: case MetaType::I32: case MetaType::I64:
+        out = (int64_t) v.u;
+        return {};
+    default:
+        return key + " is not an integer";
+    }
+}
+
+/// Fills `tail` from the metadata shard `f` (see NextnTail).  "" or the problem with qwen4exp.nextn_predict_layers
+/// or, when that is positive, qwen4exp.block_count.  An absent or zero count is no tail and asks nothing of
+/// block_count.  tools/iq_pack.py (nextn_tail) applies the same rules with the same messages.
+inline std::string qwen4exp_nextn_tail(const GgufFile& f, NextnTail& tail) {
+    tail = {};
+    const MetaValue* arch = f.get("general.architecture");
+    if (!arch || arch->type != MetaType::STRING || arch->s != "qwen4exp") return {};
+    const std::string nextn_key = "qwen4exp.nextn_predict_layers", blocks_key = "qwen4exp.block_count";
+    const MetaValue* v = f.get(nextn_key);
+    if (!v) return {};
+    int64_t nextn = 0, blocks = 0;
+    if (std::string err = meta_int64(*v, nextn_key, nextn); !err.empty()) return err;
+    if (nextn < 0) return nextn_key + " = " + std::to_string(nextn) + ", it must not be negative";
+    if (nextn == 0) return {};
+    const MetaValue* b = f.get(blocks_key);
+    if (!b) return "missing " + blocks_key;
+    if (std::string err = meta_int64(*b, blocks_key, blocks); !err.empty()) return err;
+    if (blocks <= 0) return blocks_key + " = " + std::to_string(blocks) + ", it must be positive";
+    if (nextn >= blocks)
+        return nextn_key + " = " + std::to_string(nextn) + " is not smaller than " + blocks_key + " = " +
+               std::to_string(blocks);
+    tail.first = blocks - nextn;
+    tail.end = blocks;
+    return {};
+}
+
 // ---- the model's geometry from its metadata, and the architecture guard (P1.S2).  The engine runs ONE
 // architecture, qwen4exp.  Its dimensions are read from the file (llama.cpp's key names under the arch prefix)
 // and then checked against the shape the kernels are compiled for (core/geometry.hpp), so a file of another
@@ -728,6 +799,10 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     };
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
+    // the trunk: block_count less the in-file NextN layers, which the engine does not run
+    NextnTail tail;
+    if (std::string nextn_err = qwen4exp_nextn_tail(f, tail); !nextn_err.empty()) return nextn_err;
+    if (tail.active()) g.n_layers = tail.first;
 
     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
     if (!read_int("attention.value_length", value_length, false) ||
@@ -766,9 +841,11 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     // The layer split, twice over: the interval, and a ratio per layer that is non-zero (the indexer's pooling
     // block) exactly on the full-attention layers.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
-        if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+        // a file with NextN layers may list them too; only the trunk's entries are read
+        const bool listed = v->count == (uint64_t) g.n_layers || (tail.active() && v->count == (uint64_t) tail.end);
+        if (v->type != MetaType::ARRAY || !listed || v->items.size() != v->count)
             return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
-                   " layers";
+                   " layers" + (tail.active() ? " or each of the " + std::to_string(tail.end) + " blocks" : "");
         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's
         // Qwen3.8-Flash-Next-Uncensored GGUFs carry 48 zeros; 0.1.43 never read the key): it is treated as absent
         // and the compiled pooling block is used.  A list with any non-zero entry is checked in full below.
@@ -853,7 +930,14 @@ inline std::string check_architecture(const GgufFile& f) {
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
-    if (err.empty()) err = geometry_unsupported(g);
+    if (!err.empty()) return err;
+    err = geometry_unsupported(g);
+    NextnTail tail;   // a trunk shortened by NextN layers is named as such, not as block_count
+    if (!err.empty() && g.n_layers != core::kCompiledGeometry.n_layers && qwen4exp_nextn_tail(f, tail).empty() &&
+        tail.active())
+        err = "qwen4exp trunk layer count = " + std::to_string(g.n_layers) + " (block_count " +
+              std::to_string(tail.end) + " - nextn_predict_layers " + std::to_string(tail.count()) +
+              "), the kernels are compiled for " + std::to_string(core::kCompiledGeometry.n_layers);
     return err;
 }
 

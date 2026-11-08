@@ -1,6 +1,6 @@
 // tests/core/gguf_fixture.hpp - synthetic GGUF v3 files for the loader tests (no gguf-py, no model, no GPU).
 //
-// A file is a header, metadata (strings, integers, f32, and arrays of u32 or strings), a tensor directory whose offsets are 32-byte aligned
+// A file is a header, metadata (strings, integers, bools, f32/f64, and arrays of u32 or strings), a tensor directory whose offsets are 32-byte aligned
 // in the data section, and the tensors' payloads, each filled with a pattern the test can recognise.
 #pragma once
 
@@ -18,10 +18,12 @@ namespace fixture {
 
 struct Kv {
     std::string key;
-    uint32_t type = 8;         ///< GGUF value type: 8 string, 2 u16, 4 u32, 5 i32, 6 f32, 9 array
+    uint32_t type = 8;         ///< GGUF value type: 0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool, 8 string,
+                               ///< 9 array, 10 u64, 11 i64, 12 f64
     std::string s;
-    uint64_t u = 0;
+    uint64_t u = 0;            ///< integers and bools; a signed value as its two's complement
     float f = 0;
+    double d = 0;              ///< f64
     uint32_t elem = 4;                 ///< arrays: 4 u32 (`arr`) or 8 string (`sarr`)
     std::vector<uint64_t> arr;
     std::vector<std::string> sarr;
@@ -38,6 +40,13 @@ inline Kv u16(const std::string& k, uint64_t v) { Kv r = make_kv(k, 2); r.u = v;
 inline Kv i32(const std::string& k, uint64_t v) { Kv r = make_kv(k, 5); r.u = v; return r; }
 inline Kv u32(const std::string& k, uint64_t v) { Kv r = make_kv(k, 4); r.u = v; return r; }
 inline Kv f32(const std::string& k, float v) { Kv r = make_kv(k, 6); r.f = v; return r; }
+inline Kv u8(const std::string& k, uint64_t v) { Kv r = make_kv(k, 0); r.u = v; return r; }
+inline Kv i8(const std::string& k, int64_t v) { Kv r = make_kv(k, 1); r.u = (uint64_t) v; return r; }
+inline Kv i16(const std::string& k, int64_t v) { Kv r = make_kv(k, 3); r.u = (uint64_t) v; return r; }
+inline Kv boolean(const std::string& k, bool v) { Kv r = make_kv(k, 7); r.u = v ? 1 : 0; return r; }
+inline Kv u64(const std::string& k, uint64_t v) { Kv r = make_kv(k, 10); r.u = v; return r; }
+inline Kv i64(const std::string& k, int64_t v) { Kv r = make_kv(k, 11); r.u = (uint64_t) v; return r; }
+inline Kv f64(const std::string& k, double v) { Kv r = make_kv(k, 12); r.d = v; return r; }
 inline Kv u32s(const std::string& k, std::vector<uint64_t> v) { Kv r = make_kv(k, 9); r.arr = std::move(v); return r; }
 inline Kv strs(const std::string& k, std::vector<std::string> v) {
     Kv r = make_kv(k, 9);
@@ -83,9 +92,12 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         puts(k.key);
         put32(k.type);
         if (k.type == 8) puts(k.s);
-        else if (k.type == 2) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
+        else if (k.type == 0 || k.type == 1 || k.type == 7) { const uint8_t v = (uint8_t) k.u; put(&v, 1); }
+        else if (k.type == 2 || k.type == 3) { const uint16_t v = (uint16_t) k.u; put(&v, 2); }
         else if (k.type == 4 || k.type == 5) { const uint32_t v = (uint32_t) k.u; put(&v, 4); }
         else if (k.type == 6) put(&k.f, 4);
+        else if (k.type == 10 || k.type == 11) put64(k.u);
+        else if (k.type == 12) put(&k.d, 8);
         else if (k.type == 9 && k.elem == 4) {
             put32(4);
             put64(k.arr.size());

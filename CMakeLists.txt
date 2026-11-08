@@ -828,6 +828,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(native_dense_ple_key_test PRIVATE strata_engine)
     add_test(NAME native_dense_ple_key_test COMMAND native_dense_ple_key_test)
     set_tests_properties(native_dense_ple_key_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # a qwen4exp file's in-file NextN layer (ThinkingCap): left out of served_names (no device) and of the dense load
+    add_executable(native_dense_nextn_test tests/core/native_dense_nextn_test.cpp)
+    target_link_libraries(native_dense_nextn_test PRIVATE strata_engine)
+    add_test(NAME native_dense_nextn_names COMMAND native_dense_nextn_test names)
+    set_tests_properties(native_dense_nextn_names PROPERTIES TIMEOUT 60)
+    add_test(NAME native_dense_nextn_load COMMAND native_dense_nextn_test)
+    set_tests_properties(native_dense_nextn_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # #369: per-layer admission on a sized (native pack) cache starts each layer in its own range
     add_executable(expert_cache_per_layer_test tests/core/expert_cache_per_layer_test.cpp)
     target_link_libraries(expert_cache_per_layer_test PRIVATE strata_engine)

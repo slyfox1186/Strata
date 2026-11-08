@@ -33,7 +33,8 @@ public:
     static void set_layer_range(int lb, int le);
     /// Layer split: the device bytes `load` would allocate for the matrices of layers [lb, le) - the same walk and
     /// filters, each matrix rounded up to the granule cudaMalloc backs it with - reading the GGUF headers and `table`
-    /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry.
+    /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry
+    /// except a qwen4exp model's in-file NextN layers, which the walk leaves out.
     static bool weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                  int64_t lb, int64_t le, uint64_t& out, std::string& err);
     /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key

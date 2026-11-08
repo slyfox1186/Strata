@@ -251,6 +251,32 @@ int main(int argc, char** argv) {
         fixture::write(cp, metadata("qwen4exp", coder, 8), {});
         check(geometry_of(cp, f, k, err) && f.n_expert == 256 && strata::core::compiled_geometry_mismatch(f).empty(),
               "the Coder's 256 experts are a run-time size, not a kernel mismatch");
+        // in-file NextN layers (ThinkingCap Flash-Next: 49 blocks, 1 NextN): a 48-layer trunk, and no in-file MTP
+        // block for the engine (it drafts with --mtp)
+        Dims tc = kFlashNext;
+        tc.block_count = 49;
+        std::vector<Kv> tkv = metadata("qwen4exp", tc, 8);
+        tkv.push_back(fixture::u32("qwen4exp.nextn_predict_layers", 1));
+        const fs::path tp = d.path / "thinkingcap.gguf";
+        fixture::write(tp, tkv, {});
+        check(geometry_of(tp, f, k, err) && f.n_layers == 48 && f.n_mtp_layers == 0 &&
+                  strata::core::compiled_geometry_mismatch(f).empty(),
+              "49 blocks with 1 NextN layer: 48 trunk layers, no MTP block, the compiled geometry" + err);
+        tc.block_count = 50;
+        tkv = metadata("qwen4exp", tc, 8);
+        tkv.push_back(fixture::u32("qwen4exp.nextn_predict_layers", 2));
+        fixture::write(tp, tkv, {});
+        check(geometry_of(tp, f, k, err) && f.n_layers == 48 && f.n_mtp_layers == 0,
+              "50 blocks with 2 NextN layers: 48 trunk layers" + err);
+        tkv.back() = fixture::boolean("qwen4exp.nextn_predict_layers", true);
+        fixture::write(tp, tkv, {});
+        check(!geometry_of(tp, f, k, err) && err == "qwen4exp.nextn_predict_layers is not an integer",
+              "a bool NextN count is refused by the guard: " + err);
+        tc.block_count = 49;
+        tkv = metadata("qwen4exp", tc, 8);
+        fixture::write(tp, tkv, {});
+        check(!geometry_of(tp, f, k, err) && err == "qwen4exp.block_count = 49, the kernels are compiled for 48",
+              "49 blocks without the NextN key: refused as before");
         Dims wrong = kQwen36;
         wrong.inner = 4000;
         const fs::path wp = d.path / "wrong.gguf";

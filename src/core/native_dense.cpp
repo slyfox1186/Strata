@@ -179,6 +179,18 @@ bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
            ref.ne0 > 0 && ref.ne0 <= INT_MAX && ref.ne1 > 0 && ref.ne1 <= INT_MAX && ref.ne0 % 32 == 0 &&
            tensor.shape[0] == (uint64_t) ref.ne0 && tensor.shape[1] == (uint64_t) ref.ne1;
 }
+// The in-file NextN blocks (strata::NextnTail) of the model whose shards are walked, read from its metadata shard:
+// the first that carries general.architecture and is unnumbered or split.no 0.  Later shards keep it.
+bool note_nextn_tail(const strata::GgufFile& gguf, bool& found, strata::NextnTail& tail, std::string& err) {
+    if (found || !gguf.get("general.architecture")) return true;
+    const auto* number = gguf.get("split.no");
+    if (number && number->u != 0) return true;
+    found = true;
+    err = strata::qwen4exp_nextn_tail(gguf, tail);
+    if (err.empty()) return true;
+    err = "native dense: " + err;
+    return false;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -193,11 +205,14 @@ struct Pending {
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
     try {
+        bool tail_read = false;
+        strata::NextnTail tail;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            if (!note_nextn_tail(gguf, tail_read, tail, err)) return false;
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                if (eligible(tensor, include_ple_key) && !tail.covers(tensor.name) &&
+                    strata::kernels::native_mmvq_supported(tensor.type) && tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
         return true;
@@ -218,10 +233,13 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
     try {
         std::set<std::string> seen;
         uint64_t total = 0;
+        bool tail_read = false;
+        strata::NextnTail tail;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            if (!note_nextn_tail(gguf, tail_read, tail, err)) return false;
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
+                if (!eligible(tensor, include_ple_key) || tail.covers(tensor.name)) continue;
                 if (tensor.name.rfind("blk.", 0) == 0) {
                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                     if (l < lb || l >= le) continue;
@@ -283,6 +301,8 @@ NativeDense::~NativeDense() {
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+    bool tail_read = false;
+    strata::NextnTail tail;   // the in-file NextN blocks: never uploaded, whatever the stage range
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -307,6 +327,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
                 err = strata::check_engine_architecture(gguf);
                 if (!err.empty()) return false;
+                if (!note_nextn_tail(gguf, tail_read, tail, err)) return false;
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
@@ -356,12 +377,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
                 // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
+                if (eligible(tensor, include_ple_key) && !tail.covers(tensor.name) && !outside(tensor.name) &&
                     strata::kernels::native_mmvq_supported(tensor.type))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!eligible(tensor, include_ple_key) || tail.covers(tensor.name) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
@@ -447,6 +468,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 for (const auto& tensor : gguf.tensors()) {
                     // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
                     // STRATA_HC_Q8_INJECT=1 asks for a Q8_0 copy
+                    if (tail.covers(tensor.name)) continue;
                     static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
                     const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
                     if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;

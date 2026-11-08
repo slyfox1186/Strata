@@ -138,8 +138,62 @@ def f16_values(values: np.ndarray, name: str) -> np.ndarray:
     return h
 
 
+INT64_MAX = 2**63 - 1
+
+
+def meta_int64(meta, key: str) -> int:
+    """An integer metadata value that fits an int64 (the engine's geometry type); a bool, float, string or list is
+    refused."""
+    v = meta[key]
+    if type(v) is not int:
+        raise ValueError(f"{key} is not an integer")
+    if v > INT64_MAX:
+        raise ValueError(f"{key} = {v} is out of range")
+    return v
+
+
+def nextn_tail(meta) -> tuple[int, int] | None:
+    """The blocks [first, end) of a qwen4exp model that are its in-file NextN (MTP) layers, or None: the last
+    nextn_predict_layers of its block_count blocks, which are not part of the trunk (llama.cpp's n_layer() is
+    block_count - nextn_predict_layers).  The engine drafts from its own --mtp head and reads none of their
+    tensors, so the pack leaves them out.  An absent or zero count asks nothing of block_count.  The engine applies
+    the same rules with the same messages (gguf_reader.hpp qwen4exp_nextn_tail)."""
+    nextn_key, blocks_key = "qwen4exp.nextn_predict_layers", "qwen4exp.block_count"
+    if meta.get("general.architecture") != "qwen4exp" or nextn_key not in meta:
+        return None
+    nextn = meta_int64(meta, nextn_key)
+    if nextn < 0:
+        raise ValueError(f"{nextn_key} = {nextn}, it must not be negative")
+    if nextn == 0:
+        return None
+    if blocks_key not in meta:
+        raise ValueError(f"missing {blocks_key}")
+    blocks = meta_int64(meta, blocks_key)
+    if blocks <= 0:
+        raise ValueError(f"{blocks_key} = {blocks}, it must be positive")
+    if nextn >= blocks:
+        raise ValueError(f"{nextn_key} = {nextn} is not smaller than {blocks_key} = {blocks}")
+    return blocks - nextn, blocks
+
+
+def in_tail(tail: tuple[int, int] | None, name: str) -> bool:
+    """Whether `name` is a tensor of one of the `tail` blocks ("blk." + decimal digits + ".").  A block number
+    above INT64_MAX is in no tail, as in the engine; it is compared as text, so no length reaches int()'s
+    digit limit."""
+    if tail is None:
+        return False
+    m = re.match(r"blk\.([0-9]+)\.", name)
+    if m is None:
+        return False
+    digits, top = m.group(1).lstrip("0") or "0", str(INT64_MAX)
+    if len(digits) > len(top) or (len(digits) == len(top) and digits > top):
+        return False
+    return tail[0] <= int(digits) < tail[1]
+
+
 class Model:
-    """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path)."""
+    """All shards of one model: name -> (GGUFFile, TensorInfo, memmap, shard path).  The in-file NextN blocks'
+    tensors (nextn_tail) are validated with the rest and then left out of `where`."""
 
     def __init__(self, first: pathlib.Path):
         import re
@@ -156,6 +210,7 @@ class Model:
         self.files = [G.GGUFFile(p) for p in paths]
         self.sizes = [p.stat().st_size for p in paths]
         check_split(self.files)
+        self.nextn_tail = nextn_tail(self.files[0].metadata)
         self.where = {}
         for p, g in zip(paths, self.files):
             mm = np.memmap(p, dtype=np.uint8, mode="r")
@@ -166,6 +221,13 @@ class Model:
                 if t.name in self.where:
                     raise ValueError(f"{p.name}: duplicate tensor {t.name}")
                 self.where[t.name] = (g, t, mm, p)
+        if self.nextn_tail is not None:
+            tail = [n for n in self.where if in_tail(self.nextn_tail, n)]
+            for n in tail:
+                del self.where[n]
+            first, end = self.nextn_tail
+            layers = str(first) if end - first == 1 else f"{first}-{end - 1}"
+            print(f"in-file NextN layer {layers}: {len(tail)} tensors left out (the engine drafts with --mtp)")
 
     def bytes(self, name) -> np.ndarray:
         g, t, mm, _ = self.where[name]
@@ -696,6 +758,11 @@ def main() -> int:
     if a.base:
         if any(w[3] != src for w in model.where.values() if not w[1].name in NOT_IN_PACK):
             print("--base needs a model whose tensors are all in shard 1")
+            return 1
+        tail_rows = [n for n in read_index(base / "index.txt")[1] if in_tail(model.nextn_tail, n)]
+        if tail_rows:
+            print("--base: the base pack has rows of this model's in-file NextN layers (%s), which the engine does "
+                  "not read" % ", ".join(tail_rows[:4]))
             return 1
         (out / "native_experts.txt").unlink(missing_ok=True)
         rc = index_from_base(a, src, base, out, g, {t.name: t for t in g.tensors}, mm)

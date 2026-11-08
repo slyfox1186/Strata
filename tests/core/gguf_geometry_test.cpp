@@ -266,6 +266,135 @@ int main(int argc, char** argv) {
               "another architecture is refused by name, by the reader and the guard");
     }
     {
+        // In-file NextN (MTP) layers: ThinkingCap Flash-Next declares block_count 49 and nextn_predict_layers 1,
+        // and lists 49 compress_ratios (the NextN block's is 4).  The trunk is the first 48 blocks.
+        std::vector<uint64_t> r49 = ratios(48, 4, 4);
+        r49.push_back(4);
+        const fixture::Kv bc49 = fixture::u32(p + "block_count", 49), n1 = fixture::u32(p + "nextn_predict_layers", 1);
+        const fixture::Kv cr49 = fixture::u32s(p + "attention.compress_ratios", r49);
+        auto tc = [&](std::vector<fixture::Kv> kv) { return with(with(with(std::move(kv), bc49.key, &bc49), n1.key, &n1), cr49.key, &cr49); };
+        ModelGeometry want = strata::core::kCompiledGeometry;
+        want.n_vocab = 1000;
+        const Result r = run(d.path, tc(full_keys()));
+        check(r.read_err.empty() && same_shape(r.g, want) && r.g.n_layers == 48 && r.unsupported.empty() && r.guard.empty(),
+              "49 blocks with 1 NextN layer and 49 ratios: a 48-layer trunk, accepted " + r.read_err + r.guard);
+        const fixture::Kv cr48 = fixture::u32s(p + "attention.compress_ratios", ratios(48, 4, 4));
+        const Result r48 = run(d.path, with(tc(full_keys()), cr48.key, &cr48));
+        check(r48.guard.empty() && r48.g.n_layers == 48, "  the same with 48 ratios (the trunk's only)");
+        std::vector<uint64_t> tail_only(48, 0);
+        tail_only.push_back(4);
+        const fixture::Kv tz = fixture::u32s(p + "attention.compress_ratios", tail_only);
+        const Result z = run(d.path, with(tc(full_keys()), tz.key, &tz));
+        check(z.read_err.empty() && z.guard.empty() && z.g.idx_block == 4,
+              "  48 zero trunk ratios and a non-zero NextN one: the placeholder, read as absent");
+        const fixture::Kv z49 = fixture::u32s(p + "attention.compress_ratios", std::vector<uint64_t>(49, 0));
+        check(run(d.path, with(tc(full_keys()), z49.key, &z49)).guard.empty(), "  49 zeros: the placeholder");
+        std::vector<uint64_t> shifted = r49;
+        shifted[3] = 0;
+        shifted[2] = 4;
+        const fixture::Kv sh = fixture::u32s(p + "attention.compress_ratios", shifted);
+        check(has(run(d.path, with(tc(full_keys()), sh.key, &sh)).read_err, "compress_ratios[2] = 4"),
+              "  a trunk ratio that disagrees with the interval is still refused");
+        const fixture::Kv cr50 = fixture::u32s(p + "attention.compress_ratios", ratios(50, 4, 4));
+        check(run(d.path, with(tc(full_keys()), cr50.key, &cr50)).read_err ==
+                  p + "attention.compress_ratios must list one entry for each of the 48 layers or each of the 49 blocks",
+              "  50 ratios are refused, naming both lengths");
+
+        check(has(run(d.path, with(with(full_keys(), bc49.key, &bc49), cr49.key, &cr49)).guard, "compress_ratios[48] = 4"),
+              "ThinkingCap's keys without nextn_predict_layers: block 48's ratio is refused, as before");
+        const fixture::Kv cr49i = fixture::u32s(p + "attention.compress_ratios", ratios(49, 4, 4));
+        const Result plain = run(d.path, with(with(full_keys(), bc49.key, &bc49), cr49i.key, &cr49i));
+        check(plain.guard == "qwen4exp.block_count = 49, the kernels are compiled for 48",
+              "49 blocks without nextn_predict_layers: refused as before: " + plain.guard);
+        check(run(d.path, with(full_keys(), bc49.key, &bc49)).read_err ==
+                  p + "attention.compress_ratios must list one entry for each of the 49 layers",
+              "  and 48 ratios for 49 blocks keep their message");
+        const fixture::Kv n0 = fixture::u32(p + "nextn_predict_layers", 0);
+        const Result zero = run(d.path, with(full_keys(), n0.key, &n0));
+        check(zero.guard.empty() && same_shape(zero.g, want), "nextn_predict_layers 0 is no NextN layer");
+        check(run(d.path, with(with(with(full_keys(), bc49.key, &bc49), cr49i.key, &cr49i), n0.key, &n0)).guard == plain.guard,
+              "  and 49 blocks with 0 are refused as without the key");
+
+        const fixture::Kv bc50 = fixture::u32(p + "block_count", 50), n2 = fixture::u32(p + "nextn_predict_layers", 2);
+        std::vector<uint64_t> r50 = r49;
+        r50.push_back(4);
+        const fixture::Kv cr50b = fixture::u32s(p + "attention.compress_ratios", r50);
+        const Result two = run(d.path, with(with(with(full_keys(), bc50.key, &bc50), n2.key, &n2), cr50b.key, &cr50b));
+        check(two.guard.empty() && two.g.n_layers == 48, "50 blocks with 2 NextN layers: a 48-layer trunk");
+        const Result short_trunk = run(d.path, with(tc(full_keys()), n2.key, &n2));
+        check(short_trunk.read_err.empty() && short_trunk.g.n_layers == 47 &&
+                  short_trunk.guard ==
+                      "qwen4exp trunk layer count = 47 (block_count 49 - nextn_predict_layers 2), the kernels are compiled for 48",
+              "49 blocks with 2 NextN layers: refused, naming the trunk: " + short_trunk.guard);
+
+        const std::string nk = p + "nextn_predict_layers";
+        const std::vector<std::pair<fixture::Kv, std::string>> refused = {
+            {fixture::u32(nk, 49), nk + " = 49 is not smaller than qwen4exp.block_count = 49"},
+            {fixture::u32(nk, 50), nk + " = 50 is not smaller than qwen4exp.block_count = 49"},
+            {fixture::i8(nk, -1), nk + " = -1, it must not be negative"},
+            {fixture::i16(nk, -1), nk + " = -1, it must not be negative"},
+            {fixture::i32(nk, (uint64_t) -1), nk + " = -1, it must not be negative"},
+            {fixture::i64(nk, -1), nk + " = -1, it must not be negative"},
+            {fixture::u64(nk, 1ull << 63), nk + " = 9223372036854775808 is out of range"},
+            {fixture::u64(nk, ~0ull), nk + " = 18446744073709551615 is out of range"},
+            {fixture::f32(nk, 1.0f), nk + " is not an integer"},
+            {fixture::f32(nk, 0.0f), nk + " is not an integer"},
+            {fixture::f64(nk, 1.0), nk + " is not an integer"},
+            {fixture::boolean(nk, true), nk + " is not an integer"},
+            {fixture::boolean(nk, false), nk + " is not an integer"},
+            {fixture::str(nk, "1"), nk + " is not an integer"},
+            {fixture::u32s(nk, {1}), nk + " is not an integer"},
+        };
+        for (const auto& [kv, message] : refused) {
+            const Result bad = run(d.path, with(tc(full_keys()), kv.key, &kv));
+            check(bad.read_err == message && bad.guard == message, "refused: " + message);
+        }
+        const fixture::Kv u8n = fixture::u8(nk, 1);
+        check(run(d.path, with(tc(full_keys()), u8n.key, &u8n)).guard.empty(), "a u8 count of 1 is read");
+        const fixture::Kv big = fixture::u64(p + "block_count", 1ull << 63);
+        check(run(d.path, with(tc(full_keys()), big.key, &big)).read_err ==
+                  "qwen4exp.block_count = -9223372036854775808, it must be positive",
+              "a block_count past INT64_MAX is refused by the reader, as before");
+
+        // the helper alone (the dense loader's walks call it without the guard)
+        auto tail_of = [&](const std::vector<fixture::Kv>& kv, strata::NextnTail& t) {
+            static int n = 0;
+            const fs::path f = d.path / ("t" + std::to_string(n++) + ".gguf");
+            fixture::write(f, kv, {});
+            return strata::qwen4exp_nextn_tail(strata::GgufFile(f.string()), t);
+        };
+        strata::NextnTail t;
+        check(tail_of(tc(full_keys()), t).empty() && t.first == 48 && t.end == 49 && t.count() == 1,
+              "qwen4exp_nextn_tail: [48, 49)");
+        check(tail_of(with(tc(full_keys()), big.key, &big), t) == "qwen4exp.block_count = 9223372036854775808 is out of range" &&
+                  !t.active(), "  a block_count past INT64_MAX is out of range");
+        check(tail_of(with(tc(full_keys()), bc49.key, nullptr), t) == "missing qwen4exp.block_count",
+              "  a positive count needs block_count");
+        const fixture::Kv bcs = fixture::str(p + "block_count", "x");
+        check(tail_of(with(with(full_keys(), n0.key, &n0), bc49.key, nullptr), t).empty() && !t.active() &&
+                  tail_of(with(with(full_keys(), n0.key, &n0), bcs.key, &bcs), t).empty() && !t.active(),
+              "  a zero count asks nothing of block_count");
+        check(tail_of(full_keys(), t).empty() && !t.active(), "  no key: no tail");
+        const std::vector<fixture::Kv> moe = {fixture::str("general.architecture", "qwen35moe"),
+                                              fixture::u32("qwen35moe.block_count", 41),
+                                              fixture::u32("qwen35moe.nextn_predict_layers", 1),
+                                              fixture::u32(nk, 1)};
+        check(tail_of(moe, t).empty() && !t.active(), "  another architecture: no tail (qwen35moe keeps its MTP)");
+        t = strata::NextnTail{47, 49};
+        int64_t l = -1;
+        check(strata::blk_index("blk.48.attn_q.weight", l) && l == 48 && t.covers("blk.47.attn_q.weight") &&
+                  t.covers("blk.48.nextn.eh_proj.weight") && !t.covers("blk.46.attn_q.weight") &&
+                  !t.covers("blk.49.attn_q.weight"),
+              "blk_index / covers: blocks 47 and 48 of [47, 49)");
+        check(strata::blk_index("blk.0048.attn_q.weight", l) && l == 48 && t.covers("blk.0048.attn_q.weight") &&
+                  strata::blk_index("blk.000.x", l) && l == 0,
+              "  leading zeroes read as the same block, as in the packer");
+        check(!strata::blk_index("blk.48", l) && !strata::blk_index("blk.+48.x", l) && !strata::blk_index("blk.-1.x", l) &&
+                  !strata::blk_index("blk..x", l) && !strata::blk_index("blk.4x.y", l) &&
+                  !strata::blk_index("blk.99999999999999999999.x", l) && !strata::blk_index("output.weight", l),
+              "  a name that is not blk.<digits>. is not a block tensor");
+    }
+    {
         // Qwen3.8-27B's own keys (qwen35, dense): the reader names the architecture, not the first qwen4exp key it
         // misses (which is what generate printed before the reader checked the name)
         const std::vector<fixture::Kv> dense = {
